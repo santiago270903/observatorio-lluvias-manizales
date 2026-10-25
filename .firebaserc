@@ -1,0 +1,14 @@
+{
+  "projects": {
+    "default": "observatorio-lluvias-manizales"
+  },
+  "targets": {
+    "observatorio-lluvias-manizales": {
+      "hosting": {
+        "dev": ["observatorio-lluvias-dev"],
+        "qa": ["observatorio-lluvias-qa"],
+        "prod": ["observatorio-lluvias-manizales"]
+      }
+    }
+  }
+}

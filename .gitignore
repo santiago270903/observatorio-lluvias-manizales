@@ -7,3 +7,5 @@ target/
 .idea/
 .vscode/
 .DS_Store
+.firebase/
+firebase-debug.log
