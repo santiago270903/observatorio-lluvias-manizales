@@ -1,0 +1,149 @@
+# Pipeline CI/CD del Observatorio.
+#   push a develop -> pruebas, build y despliegue a DEV
+#   push a qa      -> pruebas, build y despliegue a QA
+#   push a main    -> pruebas, build, APROBACIÓN MANUAL y despliegue a PDN
+#   pull request a qa o main -> solo pruebas y build
+# Un fallo en pruebas o build detiene el pipeline antes de desplegar.
+name: CI/CD Observatorio
+
+on:
+  push:
+    branches: [develop, qa, main]
+  pull_request:
+    branches: [qa, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FIREBASE_PROJECT: observatorio-lluvias-manizales
+  FIREBASE_TOOLS_VERSION: 15.34.1
+
+jobs:
+  frontend:
+    name: Frontend - pruebas y build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  backend:
+    name: Backend - pruebas y empaquetado
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+      - run: mvn -B test
+      - run: mvn -B package -DskipTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-jar-${{ github.sha }}
+          path: backend/target/*.jar
+          retention-days: 7
+
+  deploy:
+    name: Despliegue a ${{ github.ref_name == 'main' && 'PDN' || github.ref_name == 'qa' && 'QA' || 'DEV' }}
+    needs: [frontend, backend]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # El ambiente "production" exige aprobación manual (Settings > Environments).
+    environment:
+      name: ${{ github.ref_name == 'main' && 'production' || github.ref_name == 'qa' && 'qa' || 'dev' }}
+      url: ${{ steps.cfg.outputs.app_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolver configuración del ambiente
+        id: cfg
+        run: |
+          case "$GITHUB_REF_NAME" in
+            develop) target=dev;  app=https://observatorio-lluvias-dev.web.app;       api=https://observatorio-api-dev.onrender.com ;;
+            qa)      target=qa;   app=https://observatorio-lluvias-qa.web.app;        api=https://observatorio-api-qa.onrender.com ;;
+            main)    target=prod; app=https://observatorio-lluvias-manizales.web.app; api=https://observatorio-api-prod.onrender.com ;;
+            *) echo "La rama $GITHUB_REF_NAME no tiene ambiente asociado" >&2; exit 1 ;;
+          esac
+          {
+            echo "target=$target"
+            echo "app_url=$app"
+            echo "api_url=$api"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Desplegar API en Render
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          [ -n "$RENDER_DEPLOY_HOOK" ] || { echo "Falta el secreto RENDER_DEPLOY_HOOK del ambiente" >&2; exit 1; }
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK" -o /dev/null
+          echo "Deploy de la API solicitado a Render"
+
+      - name: Esperar la nueva versión de la API
+        run: bash scripts/wait-for-api.sh "${{ steps.cfg.outputs.api_url }}" "$GITHUB_SHA" 20
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build del frontend para el ambiente
+        working-directory: frontend
+        env:
+          VITE_API_URL: ${{ steps.cfg.outputs.api_url }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Desplegar frontend en Firebase Hosting
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          [ -n "$FIREBASE_SERVICE_ACCOUNT" ] || { echo "Falta el secreto FIREBASE_SERVICE_ACCOUNT" >&2; exit 1; }
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-sa.json"
+          trap 'rm -f "$GOOGLE_APPLICATION_CREDENTIALS"' EXIT
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > "$GOOGLE_APPLICATION_CREDENTIALS"
+          npx --yes "firebase-tools@$FIREBASE_TOOLS_VERSION" deploy \
+            --only "hosting:${{ steps.cfg.outputs.target }}" \
+            --project "$FIREBASE_PROJECT" \
+            --message "$GITHUB_SHA" \
+            --non-interactive
+
+      - name: Pruebas de humo
+        run: bash scripts/smoke-test.sh "${{ steps.cfg.outputs.app_url }}" "${{ steps.cfg.outputs.api_url }}"
+
+      - name: Registro del despliegue
+        if: always()
+        run: |
+          {
+            echo "### Despliegue ${{ job.status == 'success' && 'exitoso' || 'fallido' }}"
+            echo ""
+            echo "| Dato | Valor |"
+            echo "|---|---|"
+            echo "| Ambiente | ${{ steps.cfg.outputs.target }} |"
+            echo "| Rama | $GITHUB_REF_NAME |"
+            echo "| Commit | \`$GITHUB_SHA\` |"
+            echo "| Autor | $GITHUB_ACTOR |"
+            echo "| Frontend | ${{ steps.cfg.outputs.app_url }} |"
+            echo "| API | ${{ steps.cfg.outputs.api_url }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
